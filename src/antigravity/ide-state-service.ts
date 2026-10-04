@@ -384,14 +384,13 @@ if (!payloadPath || !fs.existsSync(payloadPath)) {
 }
 
 const payload = JSON.parse(fs.readFileSync(payloadPath, 'utf-8'));
-const { dbPath, rows, executablePath, processName, sqlAsmPath } = payload;
+const { dbPath, rows, jetskiTokenPath, jetskiTokenJson, executablePath, processName, sqlAsmPath, workspacePath } = payload;
 const ownPid = process.pid;
 
 function getOtherIdePids() {
   try {
-    const safeProcessName = String(processName || '').replace(/"/g, '');
-    if (!safeProcessName) return [];
     if (process.platform === 'win32') {
+      const safeProcessName = String(processName || 'Antigravity.exe').replace(/"/g, '');
       const out = execSync('tasklist /FI "IMAGENAME eq ' + safeProcessName + '" /FO CSV /NH', {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'ignore'],
@@ -405,7 +404,28 @@ function getOtherIdePids() {
         }
       }
       return pids;
+    } else if (process.platform === 'darwin') {
+      const out = execSync('ps -ax -o pid,command || true', {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const pids = [];
+      for (const line of out.split('\\n')) {
+        if ((line.includes('/Applications/Antigravity IDE.app') || line.includes('Antigravity IDE.app/Contents/MacOS/Electron')) &&
+            !line.includes('.inject-worker.js') &&
+            !line.includes('.relaunch-antigravity.sh') &&
+            !line.includes('crashpad') &&
+            !line.includes('grep')) {
+          const m = line.trim().match(/^(\\d+)/);
+          if (m) {
+            const p = parseInt(m[1], 10);
+            if (!isNaN(p) && p !== ownPid) pids.push(p);
+          }
+        }
+      }
+      return pids;
     } else {
+      const safeProcessName = String(processName || 'antigravity').replace(/"/g, '');
       const out = execSync('pgrep -x "' + safeProcessName + '" || true', {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'ignore'],
@@ -422,7 +442,7 @@ async function waitForIdeExit(timeoutMs) {
   while (Date.now() - start < timeoutMs) {
     const pids = getOtherIdePids();
     if (pids.length === 0) return true;
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 400));
   }
   return false;
 }
@@ -447,8 +467,8 @@ async function run() {
     forceKillRemainingPids();
   }
 
-  // Phase 2: Wait 1.5s for OS to release file locks
-  await new Promise(r => setTimeout(r, 1500));
+  // Phase 2: Wait 800ms for OS to release file locks
+  await new Promise(r => setTimeout(r, 800));
 
   // Phase 3: Update SQLite state.vscdb
   const initSqlJs = require(sqlAsmPath);
@@ -466,47 +486,82 @@ async function run() {
     }
     const out = db.export();
     fs.writeFileSync(dbPath, Buffer.from(out));
+
+    const backupDb = dbPath + '.backup';
+    if (fs.existsSync(backupDb)) {
+      try {
+        fs.writeFileSync(backupDb, Buffer.from(out));
+      } catch {}
+    }
   } finally {
     db.close();
+  }
+
+  // Phase 3b: Write ~/.gemini/jetski-standalone-oauth-token if provided
+  if (jetskiTokenPath && jetskiTokenJson) {
+    try {
+      fs.mkdirSync(path.dirname(jetskiTokenPath), { recursive: true });
+      fs.writeFileSync(jetskiTokenPath, jetskiTokenJson, { encoding: 'utf-8', mode: 0o600 });
+    } catch {}
   }
 
   // Clean up payload file
   try { fs.unlinkSync(payloadPath); } catch {}
 
   // Phase 4: Relaunch Antigravity IDE
-  if (executablePath && fs.existsSync(executablePath)) {
-    if (process.platform === 'win32') {
-      const batPath = path.join(path.dirname(payloadPath), '.relaunch-antigravity.bat');
-      const batLines = [
-        '@echo off',
-        'set ELECTRON_RUN_AS_NODE=',
-        'start "" "' + executablePath + '"',
-        'del "%~f0"'
-      ];
-      fs.writeFileSync(batPath, batLines.join(String.fromCharCode(13, 10)) + String.fromCharCode(13, 10), 'utf-8');
-      try {
-        const child = spawn('cmd.exe', ['/c', batPath], {
-          detached: true,
-          stdio: 'ignore',
-          windowsHide: true,
-        });
-        child.unref();
-      } catch {
-        execSync('powershell -NoProfile -Command "Remove-Item Env:ELECTRON_RUN_AS_NODE -EA SilentlyContinue; Start-Process \\'' + executablePath + '\\'"', { stdio: 'ignore' });
-      }
-    } else {
-      const envCopy = { ...process.env };
-      delete envCopy.ELECTRON_RUN_AS_NODE;
-      const child = spawn(executablePath, [], {
+  if (process.platform === 'darwin') {
+    const shPath = path.join(path.dirname(payloadPath), '.relaunch-antigravity.sh');
+    const wsArg = workspacePath ? (' "' + String(workspacePath).replace(/"/g, '\\\\"') + '"') : '';
+    const shLines = [
+      '#!/bin/bash',
+      'unset ELECTRON_RUN_AS_NODE',
+      'sleep 0.8',
+      '/usr/bin/open -a "Antigravity IDE"' + wsArg + ' || osascript -e \\'tell application "Antigravity IDE" to activate\\'',
+      'rm -f "$0"'
+    ];
+    fs.writeFileSync(shPath, shLines.join('\\n'), { encoding: 'utf-8', mode: 0o755 });
+    try {
+      const child = spawn('/bin/bash', [shPath], {
         detached: true,
         stdio: 'ignore',
-        env: envCopy,
       });
       child.unref();
+    } catch {
+      try {
+        execSync('env -u ELECTRON_RUN_AS_NODE /usr/bin/open -a "Antigravity IDE"' + wsArg, { stdio: 'ignore' });
+      } catch {}
     }
+  } else if (process.platform === 'win32') {
+    const batPath = path.join(path.dirname(payloadPath), '.relaunch-antigravity.bat');
+    const batLines = [
+      '@echo off',
+      'set ELECTRON_RUN_AS_NODE=',
+      'start "" "' + executablePath + '"',
+      'del "%~f0"'
+    ];
+    fs.writeFileSync(batPath, batLines.join(String.fromCharCode(13, 10)) + String.fromCharCode(13, 10), 'utf-8');
+    try {
+      const child = spawn('cmd.exe', ['/c', batPath], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      child.unref();
+    } catch {
+      execSync('powershell -NoProfile -Command "Remove-Item Env:ELECTRON_RUN_AS_NODE -EA SilentlyContinue; Start-Process \\'' + executablePath + '\\'"', { stdio: 'ignore' });
+    }
+  } else {
+    const envCopy = { ...process.env };
+    delete envCopy.ELECTRON_RUN_AS_NODE;
+    const child = spawn(executablePath, [], {
+      detached: true,
+      stdio: 'ignore',
+      env: envCopy,
+    });
+    child.unref();
   }
 
-  await new Promise(r => setTimeout(r, 2000));
+  await new Promise(r => setTimeout(r, 1500));
 }
 
 run().catch(() => process.exit(1));
@@ -523,6 +578,7 @@ run().catch(() => process.exit(1));
             oauthToken: string;
             userStatus: string;
             profileUrl?: string;
+            tokenJson?: string;
         },
     ): Promise<boolean> {
         const product = this.getProductInfo();
@@ -574,12 +630,18 @@ run().catch(() => process.exit(1));
         const payloadPath = path.join(storageDir, ".inject-payload.json");
         const workerPath = path.join(storageDir, ".inject-worker.js");
 
+        const jetskiTokenPath = path.join(os.homedir(), ".gemini", "jetski-standalone-oauth-token");
+        const currentWorkspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
         const payloadObj = {
             dbPath: product.stateDbPath,
             rows,
+            jetskiTokenPath,
+            jetskiTokenJson: target.tokenJson,
             executablePath: product.executablePath,
             processName: product.processName,
             sqlAsmPath,
+            workspacePath: currentWorkspace,
         };
 
         fs.writeFileSync(
@@ -604,8 +666,12 @@ run().catch(() => process.exit(1));
         });
         child.unref();
 
-        // Close window to trigger Antigravity IDE's graceful state flush and exit
-        await vscode.commands.executeCommand("workbench.action.closeWindow");
+        // Gracefully quit Antigravity IDE so in-memory state flushes and exits cleanly
+        if (process.platform === "darwin") {
+            await vscode.commands.executeCommand("workbench.action.quit");
+        } else {
+            await vscode.commands.executeCommand("workbench.action.closeWindow");
+        }
         return true;
     }
 }
