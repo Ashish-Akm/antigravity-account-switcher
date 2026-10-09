@@ -386,7 +386,9 @@ if (!payloadPath || !fs.existsSync(payloadPath)) {
 const payload = JSON.parse(fs.readFileSync(payloadPath, 'utf-8'));
 const { dbPath, rows, jetskiTokenPath, jetskiTokenJson, executablePath, processName, sqlAsmPath, workspacePath } = payload;
 const ownPid = process.pid;
-const logPath = '/tmp/antigravity-switcher.log';
+const logPath = process.platform === 'win32'
+  ? path.join(process.env.TEMP || process.env.TMP || 'C:\\\\Windows\\\\Temp', 'antigravity-switcher.log')
+  : '/tmp/antigravity-switcher.log';
 function log(msg) {
   try {
     fs.appendFileSync(logPath, '[' + new Date().toISOString() + '] ' + msg + '\\n');
@@ -537,15 +539,17 @@ async function run() {
       'unset ELECTRON_RUN_AS_NODE',
       'export VSCODE_CLI=',
       'TARGET="$1"',
-      'echo "[$(date -u +\\"%Y-%m-%dT%H:%M:%SZ\\")] Executing open for target: \'$TARGET\'" >> ' + logPath,
+      'echo "[$(date -u +\\"%Y-%m-%dT%H:%M:%SZ\\")] Executing open for target: \\"$TARGET\\"" >> ' + logPath,
       'if [ -n "$TARGET" ]; then',
+      '  /usr/bin/open -b com.google.antigravity-ide "$TARGET" >> ' + logPath + ' 2>&1 || \\\\',
+      '  /usr/bin/open -a "Antigravity IDE" "$TARGET" >> ' + logPath + ' 2>&1 || \\\\',
       '  /usr/bin/open -n -b com.google.antigravity-ide "$TARGET" >> ' + logPath + ' 2>&1 || \\\\',
-      '  /usr/bin/open -n -a "Antigravity IDE" "$TARGET" >> ' + logPath + ' 2>&1 || \\\\',
       '  "/Applications/Antigravity IDE.app/Contents/Resources/app/bin/antigravity-ide" "$TARGET" >> ' + logPath + ' 2>&1 || \\\\',
       '  /usr/bin/open "$TARGET" >> ' + logPath + ' 2>&1',
       'else',
+      '  /usr/bin/open -b com.google.antigravity-ide >> ' + logPath + ' 2>&1 || \\\\',
+      '  /usr/bin/open -a "Antigravity IDE" >> ' + logPath + ' 2>&1 || \\\\',
       '  /usr/bin/open -n -b com.google.antigravity-ide >> ' + logPath + ' 2>&1 || \\\\',
-      '  /usr/bin/open -n -a "Antigravity IDE" >> ' + logPath + ' 2>&1 || \\\\',
       '  "/Applications/Antigravity IDE.app/Contents/Resources/app/bin/antigravity-ide" >> ' + logPath + ' 2>&1',
       'fi',
       'echo "[$(date -u +\\"%Y-%m-%dT%H:%M:%SZ\\")] Relaunch script completed." >> ' + logPath,
@@ -582,7 +586,8 @@ async function run() {
       });
       child.unref();
     } catch {
-      execSync('powershell -NoProfile -Command "Start-Sleep -Seconds 1; Remove-Item Env:ELECTRON_RUN_AS_NODE -EA SilentlyContinue; Start-Process \\'' + executablePath + '\\'"', { stdio: 'ignore' });
+      const psCmd = 'powershell -NoProfile -Command "Start-Sleep -Seconds 1; Remove-Item Env:ELECTRON_RUN_AS_NODE -EA SilentlyContinue; Start-Process ' + JSON.stringify(executablePath) + '"';
+      execSync(psCmd, { stdio: 'ignore' });
     }
   } else {
     const envCopy = { ...process.env };
